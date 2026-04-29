@@ -1,128 +1,184 @@
 # -*- coding: utf-8 -*-
 
 """
-ReSync — EMG Thigh Activation Monitor
-======================================
-Visual prototype with simulated data.
-No hardware needed to run.
+ReSync — EMG Activation Monitor
+=================================
+Real hardware: Arduino Uno + MyoWare 2.0 + HC-05 Bluetooth.
 
 Install dependencies:
-    pip install matplotlib numpy
+    pip install matplotlib numpy pyserial
 
 Run:
-    python resync_app.py
+    python EMG_GUI.py
 """
 
 import tkinter as tk
-from tkinter import ttk
 import matplotlib.pyplot as plt
-import matplotlib.patches as patches
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
-from matplotlib.gridspec import GridSpec
 import numpy as np
 import threading
 import time
-import math
-import random
+
+try:
+    import serial
+    SERIAL_AVAILABLE = True
+except ImportError:
+    SERIAL_AVAILABLE = False
 
 # ─────────────────────────────────────────────
-# CONSTANTS
+# CONSTANTS  (must match Arduino values)
 # ─────────────────────────────────────────────
 
 COLORS = {
-    "bg":           "#0d0d14",
-    "surface":      "#13131f",
-    "surface2":     "#1a1a2e",
-    "border":       "#2a2a45",
-    "accent":       "#7c6af7",
-    "accent2":      "#4fc3f7",
-    "green":        "#4ade80",
-    "yellow":       "#fbbf24",
-    "red":          "#f87171",
-    "text":         "#e8e8f0",
-    "text2":        "#8888aa",
-    "text3":        "#4a4a6a",
-    "plot_bg":      "#0a0a12",
+    "bg":       "#0d0d14",
+    "surface":  "#13131f",
+    "surface2": "#1a1a2e",
+    "border":   "#2a2a45",
+    "accent":   "#7c6af7",
+    "accent2":  "#4fc3f7",
+    "green":    "#4ade80",
+    "yellow":   "#fbbf24",
+    "red":      "#f87171",
+    "text":     "#e8e8f0",
+    "text2":    "#8888aa",
+    "text3":    "#4a4a6a",
+    "plot_bg":  "#0a0a12",
 }
 
-FONT_TITLE  = ("Courier New", 28, "bold")
-FONT_MONO   = ("Courier New", 11)
-FONT_LABEL  = ("Courier New", 9)
-FONT_BIG    = ("Courier New", 48, "bold")
-FONT_MED    = ("Courier New", 20, "bold")
-FONT_SMALL  = ("Courier New", 10)
-FONT_BTN    = ("Courier New", 11, "bold")
+FONT_TITLE = ("Courier New", 28, "bold")
+FONT_LABEL = ("Courier New", 9)
+FONT_BIG   = ("Courier New", 48, "bold")
+FONT_MED   = ("Courier New", 20, "bold")
+FONT_SMALL = ("Courier New", 10)
+FONT_MONO  = ("Courier New", 11)
+FONT_BTN   = ("Courier New", 11, "bold")
 
-SCREENS = ["CONNECT", "CALIBRATE", "SESSION", "METRICS"]
-
-WARMUP_SECS   = 5
-CONTRACT_SECS = 5
 HISTORY_LEN   = 300
+WARMUP_SAMPLES = 200   # matches Arduino WARMUP_SAMPLES
+FATIGUE_RATIO  = 1.4   # matches Arduino FATIGUE_RATIO
+Z_THRESH       = 2.5   # matches Arduino Z_THRESH
 
 # ─────────────────────────────────────────────
-# SIMULATED DATA ENGINE
+# BLUETOOTH READER
 # ─────────────────────────────────────────────
 
-class Simulator:
-    def __init__(self, store):
+class BluetoothReader:
+    """
+    Reads serial lines from HC-05 and parses them into Store.
+    Arduino serial protocol:
+      Warmup:   "Warmup N/200"
+      Ready:    "Baseline ready — mean=X sigma=Y"
+      Telemetry:"raw=N sm=N μ=N σ=N z=N act=YES|no"
+      Rep:      "Rep: N"
+      Peak z:   "peakZ=N.NN baseline=N.NN"
+      Stop:     "*** FATIGUE DETECTED — rest now ***"
+                "*** TARGET REPS REACHED — well done! ***"
+                "Session ended early."
+    """
+
+    def __init__(self, store, port, baud=9600):
         self.store   = store
-        self.t       = 0
+        self.port    = port
+        self.baud    = baud
+        self.ser     = None
         self.running = False
 
     def start(self):
+        self.ser = serial.Serial(self.port, self.baud, timeout=1)
         self.running = True
         threading.Thread(target=self._run, daemon=True).start()
 
+    def send(self, text):
+        if self.ser and self.ser.is_open:
+            self.ser.write((str(text) + '\n').encode('utf-8'))
+
+    def stop(self):
+        self.running = False
+        if self.ser and self.ser.is_open:
+            self.ser.close()
+
     def _run(self):
         while self.running:
-            s = self.store
-            t = self.t
+            try:
+                line = self.ser.readline().decode('utf-8', errors='replace').strip()
+                if line:
+                    self._parse(line)
+            except Exception:
+                pass
 
-            # Base resting signal
-            noise    = random.gauss(0, 15)
-            baseline = 512 + noise
+    def _parse(self, line):
+        s = self.store
 
-            # During session — simulate reps every ~3 seconds
-            if s.screen == "SESSION":
-                rep_phase = (t % 150) / 150.0
-                if 0.1 < rep_phase < 0.5:
-                    activation = 600 * math.sin(math.pi * (rep_phase - 0.1) / 0.4)
-                    val = baseline + activation
-                    if rep_phase > 0.45 and not s._rep_flagged:
-                        s.rep_count  += 1
-                        s._rep_flagged = True
-                        s.rep_peaks.append(val)
-                    if rep_phase < 0.1:
-                        s._rep_flagged = False
-                else:
-                    val = baseline
-                    s._rep_flagged = False
+        # Main telemetry: "raw=512 sm=510 μ=511.0 σ=2.3 z=0.45 act=no"
+        if line.startswith('raw='):
+            data = {}
+            for token in line.split():
+                if '=' in token:
+                    k, _, v = token.partition('=')
+                    data[k] = v
+            try:
+                s.emg_raw = int(data['raw'])
+                sm = int(data['sm'])
+                s.emg_history.append(sm)
+                if len(s.emg_history) > HISTORY_LEN:
+                    s.emg_history.pop(0)
+                s.z_score = float(data['z'])
+                s.active = (data.get('act') == 'YES')
+            except (KeyError, ValueError):
+                pass
 
-                # Fatigue creeps up over time
-                s.fatigue = min(1.0, t / 1800.0)
+        # Warmup progress: "Warmup 50/200"
+        elif line.startswith('Warmup'):
+            try:
+                nums = line.split()[1].split('/')
+                s.cal_progress = int(nums[0]) / int(nums[1])
+            except (IndexError, ValueError, ZeroDivisionError):
+                pass
 
-            elif s.screen == "CALIBRATE" and s.cal_phase == "contract":
-                val = baseline + 550 + random.gauss(0, 20)
-            else:
-                val = baseline
+        # Warmup complete: "Baseline ready — mean=X sigma=Y"
+        elif 'Baseline ready' in line:
+            s.cal_progress  = 1.0
+            s.arduino_ready = True
 
-            val = max(0, min(1023, val))
-            s.emg_raw = int(val)
-            s.emg_history.append(int(val))
-            if len(s.emg_history) > HISTORY_LEN:
-                s.emg_history.pop(0)
+        # Rep count: "Rep: 5"
+        elif line.startswith('Rep:'):
+            try:
+                s.rep_count = int(line.split(':')[1].strip())
+            except (ValueError, IndexError):
+                pass
 
-            # Z-score
-            if len(s.emg_history) > 20:
-                arr  = np.array(s.emg_history[-100:])
-                mu   = np.mean(arr)
-                sig  = max(np.std(arr), 0.5)
-                s.z_score = (val - mu) / sig
-                s.mu      = mu
-                s.sigma   = sig
+        # Peak z after rep: "peakZ=3.20 baseline=2.50"
+        elif line.startswith('peakZ='):
+            data = {}
+            for token in line.split():
+                if '=' in token:
+                    k, _, v = token.partition('=')
+                    data[k] = v
+            try:
+                peak = float(data['peakZ'])
+                base = float(data['baseline'])
+                s.rep_peaks.append(peak)
+                if base > 0 and peak > base:
+                    # Scale 0→0%, ratio>=FATIGUE_RATIO→100%
+                    s.fatigue = min(1.0, (peak / base - 1.0) / (FATIGUE_RATIO - 1.0))
+            except (KeyError, ValueError):
+                pass
 
-            self.t += 1
-            time.sleep(0.02)
+        # Session stop conditions — Arduino resets itself to WAIT_STATE,
+        # GUI navigates to METRICS then back to CALIBRATE for next session.
+        elif 'FATIGUE DETECTED' in line:
+            s.fatigue          = 1.0
+            s.session_complete = True
+
+        elif 'TARGET REPS REACHED' in line:
+            s.session_complete = True
+
+        elif 'Session ended early' in line:
+            s.session_complete = True
+
+        # Arduino back in WAIT_STATE after a session — signal GUI to reset
+        elif 'start a new session' in line:
+            s.arduino_in_wait = True
 
 
 # ─────────────────────────────────────────────
@@ -131,22 +187,23 @@ class Simulator:
 
 class Store:
     def __init__(self):
-        self.screen        = "CONNECT"
-        self.connected     = False
-        self.emg_raw       = 0
-        self.emg_history   = []
-        self.z_score       = 0.0
-        self.mu            = 512.0
-        self.sigma         = 1.0
-        self.rep_count     = 0
-        self.rep_peaks     = []
-        self.fatigue       = 0.0
-        self.cal_phase     = "idle"   # idle | rest | contract | done
-        self.cal_progress  = 0.0
-        self.threshold     = None
-        self.session_start = None
-        self._rep_flagged  = False
-        self.metrics       = {}
+        self.screen           = "CONNECT"
+        self.connected        = False
+        self.emg_raw          = 0
+        self.emg_history      = []
+        self.z_score          = 0.0
+        self.active           = False
+        self.rep_count        = 0
+        self.rep_peaks        = []
+        self.fatigue          = 0.0
+        self.cal_progress     = 0.0
+        self.session_start    = None
+        self.metrics          = {}
+        self.arduino_ready    = False   # warmup complete, can start session
+        self.arduino_in_wait  = False   # Arduino returned to WAIT_STATE after session
+        self.session_complete = False   # fatigue / reps reached / quit
+        self.target_reps      = 0       # 0 = no limit
+
 
 # ─────────────────────────────────────────────
 # MAIN APP
@@ -160,8 +217,11 @@ class ReSync(tk.Tk):
         self.configure(bg=COLORS["bg"])
         self.resizable(True, True)
 
-        self.store = Store()
-        self.sim   = Simulator(self.store)
+        self.store  = Store()
+        self.reader = None
+
+        self._cal_ready_shown = False
+        self._session_ended   = False
 
         self._build_ui()
         self._update_loop()
@@ -171,9 +231,8 @@ class ReSync(tk.Tk):
     # ─────────────────────────────────────────
 
     def _build_ui(self):
-        # ── Header ──
         hdr = tk.Frame(self, bg=COLORS["bg"], height=64)
-        hdr.pack(fill="x", padx=0, pady=0)
+        hdr.pack(fill="x")
         hdr.pack_propagate(False)
 
         tk.Label(hdr, text="RE", font=FONT_TITLE,
@@ -188,14 +247,11 @@ class ReSync(tk.Tk):
                                     bg=COLORS["bg"], fg=COLORS["red"])
         self.status_dot.pack(side="right", padx=(0, 8), pady=16)
         self.status_lbl = tk.Label(hdr, text="DISCONNECTED",
-                                    font=FONT_LABEL, bg=COLORS["bg"],
-                                    fg=COLORS["text2"])
+                                    font=FONT_LABEL, bg=COLORS["bg"], fg=COLORS["text2"])
         self.status_lbl.pack(side="right", pady=16)
 
-        # Divider
         tk.Frame(self, bg=COLORS["border"], height=1).pack(fill="x")
 
-        # ── Content area ──
         self.content = tk.Frame(self, bg=COLORS["bg"])
         self.content.pack(fill="both", expand=True)
 
@@ -221,115 +277,116 @@ class ReSync(tk.Tk):
         f = tk.Frame(self.content, bg=COLORS["bg"])
         self._screens["CONNECT"] = f
 
-        # Centre column
         col = tk.Frame(f, bg=COLORS["bg"])
         col.place(relx=0.5, rely=0.5, anchor="center")
 
         tk.Label(col, text="DEVICE SETUP", font=("Courier New", 13, "bold"),
                  bg=COLORS["bg"], fg=COLORS["text3"]).pack(pady=(0, 4))
-        tk.Label(col, text="Connect your ReSync cuff\nto begin monitoring",
+        tk.Label(col, text="Connect your ReSync cuff via HC-05 Bluetooth",
                  font=FONT_SMALL, bg=COLORS["bg"],
-                 fg=COLORS["text2"], justify="center").pack(pady=(0, 32))
+                 fg=COLORS["text2"], justify="center").pack(pady=(0, 20))
 
-        # Big connect button
+        # COM port entry
+        port_row = tk.Frame(col, bg=COLORS["bg"])
+        port_row.pack(pady=(0, 16))
+        tk.Label(port_row, text="COM PORT", font=FONT_LABEL,
+                 bg=COLORS["bg"], fg=COLORS["text3"], width=12, anchor="w").pack(side="left")
+        self.com_port_var = tk.StringVar(value="COM3")
+        tk.Entry(port_row, textvariable=self.com_port_var,
+                 font=FONT_MONO, bg=COLORS["surface2"], fg=COLORS["text"],
+                 insertbackground=COLORS["text"], relief="flat",
+                 highlightthickness=1, highlightbackground=COLORS["border"],
+                 width=10).pack(side="left", padx=(8, 0))
+
         self.btn_connect = self._make_button(
             col, "[ CONNECT BLUETOOTH ]",
             command=self._on_connect,
-            color=COLORS["accent"], width=28
-        )
+            color=COLORS["accent"], width=28)
         self.btn_connect.pack(pady=8)
 
-        self.connect_msg = tk.Label(col, text="",
-                                     font=FONT_LABEL, bg=COLORS["bg"],
-                                     fg=COLORS["text2"])
+        self.connect_msg = tk.Label(col, text="", font=FONT_LABEL,
+                                     bg=COLORS["bg"], fg=COLORS["text2"])
         self.connect_msg.pack(pady=4)
 
-        # Device info box
-        info = tk.Frame(col, bg=COLORS["surface"], bd=0,
-                         highlightthickness=1,
+        info = tk.Frame(col, bg=COLORS["surface"], highlightthickness=1,
                          highlightbackground=COLORS["border"])
         info.pack(pady=20, fill="x")
-
         rows = [
             ("DEVICE",    "HC-05 Bluetooth Module"),
             ("BAUD",      "9600"),
             ("SENSOR",    "MyoWare 2.0 EMG"),
-            ("PLACEMENT", "Rectus Femoris (Thigh)"),
+            ("ALGORITHM", "Z-Score / Welford online"),
         ]
         for i, (k, v) in enumerate(rows):
             bg = COLORS["surface"] if i % 2 == 0 else COLORS["surface2"]
             row = tk.Frame(info, bg=bg)
             row.pack(fill="x")
-            tk.Label(row, text=k, font=FONT_LABEL,
-                     bg=bg, fg=COLORS["text3"], width=12,
-                     anchor="w").pack(side="left", padx=12, pady=6)
-            tk.Label(row, text=v, font=FONT_LABEL,
-                     bg=bg, fg=COLORS["text"], anchor="w").pack(side="left")
+            tk.Label(row, text=k, font=FONT_LABEL, bg=bg, fg=COLORS["text3"],
+                     width=12, anchor="w").pack(side="left", padx=12, pady=6)
+            tk.Label(row, text=v, font=FONT_LABEL, bg=bg,
+                     fg=COLORS["text"], anchor="w").pack(side="left")
 
     # ─────────────────────────────────────────
-    # SCREEN: CALIBRATE
+    # SCREEN: CALIBRATE  (Arduino warmup + session setup)
     # ─────────────────────────────────────────
 
     def _build_calibrate_screen(self):
         f = tk.Frame(self.content, bg=COLORS["bg"])
         self._screens["CALIBRATE"] = f
 
-        # Left — instructions
         left = tk.Frame(f, bg=COLORS["bg"], width=380)
         left.pack(side="left", fill="y", padx=(32, 0), pady=32)
         left.pack_propagate(False)
 
-        tk.Label(left, text="CALIBRATION", font=("Courier New", 13, "bold"),
+        tk.Label(left, text="DEVICE WARMUP", font=("Courier New", 13, "bold"),
                  bg=COLORS["bg"], fg=COLORS["text3"]).pack(anchor="w")
-        tk.Label(left, text="Personalise your threshold",
-                 font=FONT_SMALL, bg=COLORS["bg"],
-                 fg=COLORS["text2"]).pack(anchor="w", pady=(2, 24))
+        tk.Label(left, text="Building EMG baseline — keep muscle at rest",
+                 font=FONT_SMALL, bg=COLORS["bg"], fg=COLORS["text2"]).pack(anchor="w", pady=(2, 24))
 
-        # Phase indicator
-        self.cal_phase_lbl = tk.Label(left, text="READY TO CALIBRATE",
-                                       font=FONT_MED,
-                                       bg=COLORS["bg"], fg=COLORS["text"],
-                                       wraplength=340, justify="left")
+        self.cal_phase_lbl = tk.Label(left, text="COLLECTING BASELINE...",
+                                       font=FONT_MED, bg=COLORS["bg"],
+                                       fg=COLORS["accent2"], wraplength=340, justify="left")
         self.cal_phase_lbl.pack(anchor="w", pady=(0, 8))
 
         self.cal_instruction = tk.Label(
             left,
-            text="Press Start Calibration below.\nYou will be guided through\na rest phase and a max contraction.",
-            font=FONT_SMALL, bg=COLORS["bg"],
-            fg=COLORS["text2"], justify="left")
+            text="Relax the target muscle completely.\nThe device is sampling your resting signal.",
+            font=FONT_SMALL, bg=COLORS["bg"], fg=COLORS["text2"], justify="left")
         self.cal_instruction.pack(anchor="w", pady=(0, 24))
 
-        # Progress bar
-        tk.Label(left, text="PROGRESS", font=FONT_LABEL,
+        tk.Label(left, text="WARMUP PROGRESS", font=FONT_LABEL,
                  bg=COLORS["bg"], fg=COLORS["text3"]).pack(anchor="w")
         prog_bg = tk.Frame(left, bg=COLORS["surface2"], height=8,
-                            highlightthickness=1,
-                            highlightbackground=COLORS["border"])
+                            highlightthickness=1, highlightbackground=COLORS["border"])
         prog_bg.pack(fill="x", pady=(4, 20))
         self.cal_prog_fill = tk.Frame(prog_bg, bg=COLORS["accent"], height=8)
         self.cal_prog_fill.place(x=0, y=0, relheight=1, relwidth=0)
 
-        # Countdown
-        self.cal_countdown = tk.Label(left, text="",
-                                       font=FONT_BIG,
-                                       bg=COLORS["bg"], fg=COLORS["accent"])
-        self.cal_countdown.pack(anchor="w", pady=(0, 24))
+        self.cal_status_lbl = tk.Label(left, text="", font=FONT_BIG,
+                                        bg=COLORS["bg"], fg=COLORS["accent"])
+        self.cal_status_lbl.pack(anchor="w", pady=(0, 16))
 
-        self.btn_start_cal = self._make_button(
-            left, "[ START CALIBRATION ]",
-            command=self._on_start_cal,
-            color=COLORS["accent"], width=26
-        )
-        self.btn_start_cal.pack(anchor="w", pady=4)
+        # Rep target + start button — shown only after warmup completes
+        self.rep_setup_frame = tk.Frame(left, bg=COLORS["bg"])
 
-        self.btn_to_session = self._make_button(
-            left, "[ START SESSION → ]",
-            command=lambda: self._show_screen("SESSION"),
-            color=COLORS["green"], width=26
-        )
-        # Hidden until cal done
+        tk.Label(self.rep_setup_frame, text="REP TARGET  (optional)",
+                 font=FONT_LABEL, bg=COLORS["bg"], fg=COLORS["text3"]).pack(anchor="w")
+        rep_row = tk.Frame(self.rep_setup_frame, bg=COLORS["bg"])
+        rep_row.pack(anchor="w", pady=(4, 16))
+        self.rep_target_var = tk.StringVar(value="")
+        tk.Entry(rep_row, textvariable=self.rep_target_var,
+                 font=FONT_MONO, bg=COLORS["surface2"], fg=COLORS["text"],
+                 insertbackground=COLORS["text"], relief="flat",
+                 highlightthickness=1, highlightbackground=COLORS["border"],
+                 width=8).pack(side="left")
+        tk.Label(rep_row, text="  leave blank = until fatigue",
+                 font=FONT_LABEL, bg=COLORS["bg"], fg=COLORS["text3"]).pack(side="left")
 
-        # Right — live signal
+        self._make_button(self.rep_setup_frame, "[ START SESSION → ]",
+                           command=self._on_start_session,
+                           color=COLORS["green"], width=26).pack(anchor="w", pady=4)
+
+        # Right: live signal plot during warmup
         right = tk.Frame(f, bg=COLORS["bg"])
         right.pack(side="left", fill="both", expand=True, padx=24, pady=32)
         self._build_mini_plot(right, "cal")
@@ -342,12 +399,10 @@ class ReSync(tk.Tk):
         f = tk.Frame(self.content, bg=COLORS["bg"])
         self._screens["SESSION"] = f
 
-        # ── Top row: rep counter + z-score + fatigue ──
         top = tk.Frame(f, bg=COLORS["bg"])
         top.pack(fill="x", padx=24, pady=(20, 8))
 
-        # Rep counter card
-        rep_card = self._make_card(top, width=200, height=130)
+        rep_card = self._make_card(top, 200, 130)
         rep_card.pack(side="left", padx=(0, 12))
         tk.Label(rep_card, text="REPS", font=FONT_LABEL,
                  bg=COLORS["surface"], fg=COLORS["text3"]).place(x=16, y=12)
@@ -355,8 +410,7 @@ class ReSync(tk.Tk):
                                  bg=COLORS["surface"], fg=COLORS["green"])
         self.rep_lbl.place(relx=0.5, rely=0.55, anchor="center")
 
-        # Z-score card
-        z_card = self._make_card(top, width=200, height=130)
+        z_card = self._make_card(top, 200, 130)
         z_card.pack(side="left", padx=(0, 12))
         tk.Label(z_card, text="Z-SCORE", font=FONT_LABEL,
                  bg=COLORS["surface"], fg=COLORS["text3"]).place(x=16, y=12)
@@ -368,8 +422,7 @@ class ReSync(tk.Tk):
         self.z_bar_fill = tk.Frame(z_card, bg=COLORS["accent2"], height=6)
         self.z_bar_fill.place(x=12, y=108, width=0)
 
-        # Session timer card
-        tim_card = self._make_card(top, width=200, height=130)
+        tim_card = self._make_card(top, 200, 130)
         tim_card.pack(side="left", padx=(0, 12))
         tk.Label(tim_card, text="ELAPSED", font=FONT_LABEL,
                  bg=COLORS["surface"], fg=COLORS["text3"]).place(x=16, y=12)
@@ -377,34 +430,25 @@ class ReSync(tk.Tk):
                                    bg=COLORS["surface"], fg=COLORS["text"])
         self.timer_lbl.place(relx=0.5, rely=0.5, anchor="center")
 
-        # End session button (right side)
         btn_frame = tk.Frame(top, bg=COLORS["bg"])
         btn_frame.pack(side="right")
         self._make_button(btn_frame, "[ END SESSION ]",
                            command=self._on_end_session,
                            color=COLORS["red"], width=18).pack()
 
-        # ── Fatigue bar ──
         fat_frame = tk.Frame(f, bg=COLORS["bg"])
         fat_frame.pack(fill="x", padx=24, pady=(0, 8))
-
-        tk.Label(fat_frame, text="FATIGUE INDEX",
-                 font=FONT_LABEL, bg=COLORS["bg"],
-                 fg=COLORS["text3"]).pack(side="left", padx=(0, 12))
-
+        tk.Label(fat_frame, text="FATIGUE INDEX", font=FONT_LABEL,
+                 bg=COLORS["bg"], fg=COLORS["text3"]).pack(side="left", padx=(0, 12))
         fat_bg = tk.Frame(fat_frame, bg=COLORS["surface2"], height=14,
-                           highlightthickness=1,
-                           highlightbackground=COLORS["border"])
+                           highlightthickness=1, highlightbackground=COLORS["border"])
         fat_bg.pack(side="left", fill="x", expand=True)
         self.fat_fill = tk.Frame(fat_bg, bg=COLORS["green"], height=14)
         self.fat_fill.place(x=0, y=0, relheight=1, relwidth=0)
-
-        self.fat_lbl = tk.Label(fat_frame, text="0%",
-                                 font=FONT_LABEL, bg=COLORS["bg"],
-                                 fg=COLORS["text2"], width=5)
+        self.fat_lbl = tk.Label(fat_frame, text="0%", font=FONT_LABEL,
+                                 bg=COLORS["bg"], fg=COLORS["text2"], width=5)
         self.fat_lbl.pack(side="left", padx=(8, 0))
 
-        # ── Live plot ──
         plot_frame = tk.Frame(f, bg=COLORS["bg"])
         plot_frame.pack(fill="both", expand=True, padx=24, pady=(0, 16))
         self._build_main_plot(plot_frame)
@@ -419,28 +463,22 @@ class ReSync(tk.Tk):
 
         tk.Label(f, text="SESSION COMPLETE", font=("Courier New", 13, "bold"),
                  bg=COLORS["bg"], fg=COLORS["text3"]).pack(pady=(24, 2))
-        tk.Label(f, text="Performance summary",
-                 font=FONT_SMALL, bg=COLORS["bg"],
-                 fg=COLORS["text2"]).pack(pady=(0, 16))
+        tk.Label(f, text="Performance summary", font=FONT_SMALL,
+                 bg=COLORS["bg"], fg=COLORS["text2"]).pack(pady=(0, 16))
 
-        # Two column layout
         cols = tk.Frame(f, bg=COLORS["bg"])
         cols.pack(fill="both", expand=True, padx=24)
 
-        # Left — stats
         left = tk.Frame(cols, bg=COLORS["bg"], width=320)
         left.pack(side="left", fill="y", padx=(0, 16))
         left.pack_propagate(False)
-
         self.metrics_frame = tk.Frame(left, bg=COLORS["bg"])
         self.metrics_frame.pack(fill="both", expand=True)
 
-        # Right — chart
         right = tk.Frame(cols, bg=COLORS["bg"])
         right.pack(side="left", fill="both", expand=True)
         self._build_metrics_plot(right)
 
-        # Bottom buttons
         btn_row = tk.Frame(f, bg=COLORS["bg"])
         btn_row.pack(pady=16)
         self._make_button(btn_row, "[ NEW SESSION ]",
@@ -457,18 +495,12 @@ class ReSync(tk.Tk):
         ax.tick_params(colors=COLORS["text3"], labelsize=7)
         for spine in ax.spines.values():
             spine.set_color(COLORS["border"])
-        ax.set_ylabel("EMG", color=COLORS["text3"], fontsize=7,
-                       fontfamily="monospace")
-        ax.set_xlabel("samples", color=COLORS["text3"], fontsize=7,
-                       fontfamily="monospace")
-
-        line, = ax.plot([], [], color=COLORS["accent"], linewidth=1.2,
-                         alpha=0.9)
+        ax.set_ylabel("EMG", color=COLORS["text3"], fontsize=7, fontfamily="monospace")
+        ax.set_xlabel("samples", color=COLORS["text3"], fontsize=7, fontfamily="monospace")
+        line, = ax.plot([], [], color=COLORS["accent"], linewidth=1.2, alpha=0.9)
         fig.tight_layout(pad=0.8)
-
         canvas = FigureCanvasTkAgg(fig, master=parent)
         canvas.get_tk_widget().pack(fill="both", expand=True)
-
         setattr(self, f"mini_ax_{tag}", ax)
         setattr(self, f"mini_line_{tag}", line)
         setattr(self, f"mini_canvas_{tag}", canvas)
@@ -479,30 +511,23 @@ class ReSync(tk.Tk):
         ax.tick_params(colors=COLORS["text3"], labelsize=7)
         for spine in ax.spines.values():
             spine.set_color(COLORS["border"])
-        ax.set_ylabel("EMG", color=COLORS["text3"], fontsize=7,
-                       fontfamily="monospace")
-        ax.set_xlabel("samples", color=COLORS["text3"], fontsize=7,
-                       fontfamily="monospace")
-
-        self.main_line, = ax.plot([], [], color=COLORS["accent2"],
-                                   linewidth=1.2, alpha=0.9)
-        self.thresh_line = ax.axhline(y=0, color=COLORS["yellow"],
-                                       linewidth=1, linestyle="--",
-                                       alpha=0.6, visible=False)
+        ax.set_ylabel("EMG", color=COLORS["text3"], fontsize=7, fontfamily="monospace")
+        ax.set_xlabel("samples", color=COLORS["text3"], fontsize=7, fontfamily="monospace")
+        self.main_line, = ax.plot([], [], color=COLORS["accent2"], linewidth=1.2, alpha=0.9)
+        # Threshold line at Z_THRESH — shown as a horizontal reference
+        self.thresh_line = ax.axhline(y=0, color=COLORS["yellow"], linewidth=1,
+                                       linestyle="--", alpha=0.6, visible=False)
         fig.tight_layout(pad=0.8)
-
         self.main_canvas = FigureCanvasTkAgg(fig, master=parent)
         self.main_canvas.get_tk_widget().pack(fill="both", expand=True)
         self.main_ax = ax
 
     def _build_metrics_plot(self, parent):
-        self.met_fig, self.met_ax = plt.subplots(
-            figsize=(5, 3.2), facecolor=COLORS["plot_bg"])
+        self.met_fig, self.met_ax = plt.subplots(figsize=(5, 3.2), facecolor=COLORS["plot_bg"])
         self.met_ax.set_facecolor(COLORS["plot_bg"])
         self.met_ax.tick_params(colors=COLORS["text3"], labelsize=7)
         for spine in self.met_ax.spines.values():
             spine.set_color(COLORS["border"])
-
         self.met_canvas = FigureCanvasTkAgg(self.met_fig, master=parent)
         self.met_canvas.get_tk_widget().pack(fill="both", expand=True)
 
@@ -511,186 +536,154 @@ class ReSync(tk.Tk):
     # ─────────────────────────────────────────
 
     def _make_button(self, parent, text, command, color, width=20):
-        btn = tk.Button(
+        return tk.Button(
             parent, text=text, command=command,
             font=FONT_BTN, fg=color, bg=COLORS["surface"],
             activeforeground=COLORS["bg"], activebackground=color,
             relief="flat", bd=0, cursor="hand2",
             highlightthickness=1, highlightbackground=color,
-            width=width, pady=8
-        )
-        return btn
+            width=width, pady=8)
 
     def _make_card(self, parent, width, height):
         f = tk.Frame(parent, bg=COLORS["surface"], width=width, height=height,
-                      highlightthickness=1,
-                      highlightbackground=COLORS["border"])
+                      highlightthickness=1, highlightbackground=COLORS["border"])
         f.pack_propagate(False)
         return f
 
     def _stat_row(self, parent, label, value, color=None):
         row = tk.Frame(parent, bg=COLORS["surface"],
-                        highlightthickness=1,
-                        highlightbackground=COLORS["border"])
+                        highlightthickness=1, highlightbackground=COLORS["border"])
         row.pack(fill="x", pady=3)
-        tk.Label(row, text=label, font=FONT_LABEL,
-                 bg=COLORS["surface"], fg=COLORS["text3"],
-                 width=22, anchor="w").pack(side="left", padx=12, pady=8)
-        tk.Label(row, text=str(value), font=FONT_LABEL,
-                 bg=COLORS["surface"],
+        tk.Label(row, text=label, font=FONT_LABEL, bg=COLORS["surface"],
+                 fg=COLORS["text3"], width=22, anchor="w").pack(side="left", padx=12, pady=8)
+        tk.Label(row, text=str(value), font=FONT_LABEL, bg=COLORS["surface"],
                  fg=color or COLORS["text"]).pack(side="right", padx=12)
 
     # ─────────────────────────────────────────
-    # BUTTON ACTIONS
+    # ACTIONS
     # ─────────────────────────────────────────
 
     def _on_connect(self):
+        if not SERIAL_AVAILABLE:
+            self.connect_msg.config(
+                text="pyserial not installed — run: pip install pyserial",
+                fg=COLORS["red"])
+            return
+
+        port = self.com_port_var.get().strip()
+        if not port:
+            self.connect_msg.config(text="Enter a COM port first.", fg=COLORS["yellow"])
+            return
+
         self.connect_msg.config(text="Connecting...", fg=COLORS["yellow"])
         self.btn_connect.config(state="disabled")
-        self.sim.start()
 
-        def finish():
-            time.sleep(1.5)   # simulate connection delay
-            self.store.connected = True
-            self.after(0, lambda: [
-                self.connect_msg.config(
-                    text="Connected ✓  Redirecting...",
-                    fg=COLORS["green"]),
-                self.after(800, lambda: self._show_screen("CALIBRATE"))
-            ])
-        threading.Thread(target=finish, daemon=True).start()
+        def attempt():
+            try:
+                self.reader = BluetoothReader(self.store, port)
+                self.reader.start()
+                self.store.connected = True
+                self.after(0, lambda: [
+                    self.connect_msg.config(text=f"Connected on {port}", fg=COLORS["green"]),
+                    self.after(600, lambda: self._show_screen("CALIBRATE"))
+                ])
+            except Exception as e:
+                self.after(0, lambda err=e: [
+                    self.connect_msg.config(text=f"Failed: {err}", fg=COLORS["red"]),
+                    self.btn_connect.config(state="normal")
+                ])
 
-    def _on_start_cal(self):
-        self.btn_start_cal.config(state="disabled")
-        self.store.cal_phase = "rest"
-        self._run_cal_rest()
+        threading.Thread(target=attempt, daemon=True).start()
 
-    def _run_cal_rest(self):
-        self.cal_phase_lbl.config(text="PHASE 1 — REST",
-                                   fg=COLORS["accent2"])
-        self.cal_instruction.config(
-            text="Relax your thigh muscle completely.\nDo not move.")
-        self._cal_countdown(WARMUP_SECS, color=COLORS["accent2"],
-                             on_done=self._run_cal_contract)
-
-    def _run_cal_contract(self):
-        self.store.cal_phase = "contract"
-        self.cal_phase_lbl.config(text="PHASE 2 — MAX CONTRACTION",
-                                   fg=COLORS["yellow"])
-        self.cal_instruction.config(
-            text="Contract your thigh as hard as you can\nand hold it!")
-        self._cal_countdown(CONTRACT_SECS, color=COLORS["yellow"],
-                             on_done=self._cal_done)
-
-    def _cal_countdown(self, secs, color, on_done):
-        start = time.time()
-        total = secs
-
-        def tick():
-            elapsed = time.time() - start
-            remaining = max(0, total - elapsed)
-            pct = min(1.0, elapsed / total)
-
-            self.cal_countdown.config(
-                text=str(math.ceil(remaining)) if remaining > 0 else "0",
-                fg=color)
-            self.cal_prog_fill.place(relwidth=pct)
-
-            if elapsed < total:
-                self.after(50, tick)
-            else:
-                on_done()
-
-        tick()
-
-    def _cal_done(self):
-        self.store.cal_phase = "done"
-        # Compute threshold from collected history
-        if len(self.store.emg_history) > 10:
-            arr = np.array(self.store.emg_history[-50:])
-            self.store.threshold = float(np.mean(arr) + 2.5 * np.std(arr))
-
-        self.cal_phase_lbl.config(text="CALIBRATION COMPLETE",
-                                   fg=COLORS["green"])
-        self.cal_instruction.config(
-            text="Threshold saved. Press Start Session\nwhen you are ready.")
-        self.cal_countdown.config(text="✓", fg=COLORS["green"])
-        self.btn_to_session.pack(anchor="w", pady=4)
+    def _on_start_session(self):
+        """Send optional rep target then 's' to Arduino, then show SESSION screen."""
+        target_str = self.rep_target_var.get().strip()
+        if target_str.isdigit() and int(target_str) > 0:
+            self.store.target_reps = int(target_str)
+            self.reader.send(target_str)   # Arduino receives number, sets targetReps
+        else:
+            self.store.target_reps = 0
+        self.reader.send('s')              # Arduino transitions WAIT_STATE → RUNNING_STATE
+        self.store.session_start = time.time()
+        self._session_ended = False
+        self._show_screen("SESSION")
 
     def _on_end_session(self):
-        self.store.screen = "METRICS"
+        """User pressed End Session — send 'q' to Arduino then show metrics."""
+        if self.reader:
+            self.reader.send('q')          # Arduino calls endSession(), resets to WAIT_STATE
+        self._go_to_metrics()
+
+    def _go_to_metrics(self):
+        if self._session_ended:
+            return
+        self._session_ended = True
         self._compute_metrics()
         self._show_screen("METRICS")
 
     def _on_new_session(self):
+        """
+        Arduino already reset itself to WAIT_STATE after the session ended.
+        GUI resets its own counters and goes back to CALIBRATE/setup screen
+        so the user can set a rep target and press Start again.
+        Warmup is NOT re-run — Arduino kept the Welford baseline.
+        """
         s = self.store
-        s.rep_count   = 0
-        s.rep_peaks   = []
-        s.fatigue     = 0.0
-        s.session_start = None
-        s.cal_phase   = "idle"
-        s.cal_progress = 0.0
-        self.btn_start_cal.config(state="normal")
-        self.btn_to_session.pack_forget()
-        self.cal_phase_lbl.config(text="READY TO CALIBRATE",
-                                   fg=COLORS["text"])
+        s.rep_count        = 0
+        s.rep_peaks        = []
+        s.fatigue          = 0.0
+        s.session_start    = None
+        s.session_complete = False
+        s.arduino_in_wait  = False
+        s.target_reps      = 0
+        s.cal_progress     = 1.0          # warmup already done
+        self._session_ended   = False
+
+        self.rep_target_var.set("")
+        self.cal_phase_lbl.config(text="BASELINE READY", fg=COLORS["green"])
         self.cal_instruction.config(
-            text="Press Start Calibration below.\nYou will be guided through\na rest phase and a max contraction.")
-        self.cal_countdown.config(text="")
-        self.cal_prog_fill.place(relwidth=0)
+            text="Set an optional rep target and press Start Session.")
+        self.cal_status_lbl.config(text="✓", fg=COLORS["green"])
+        self.cal_prog_fill.place(relwidth=1.0)
+        self.rep_setup_frame.pack(anchor="w", pady=(8, 0))
         self._show_screen("CALIBRATE")
 
     def _compute_metrics(self):
-        s = self.store
+        s     = self.store
         peaks = s.rep_peaks if s.rep_peaks else [0]
-        duration = round(time.time() - s.session_start, 1) \
-            if s.session_start else 0
+        dur   = round(time.time() - s.session_start, 1) if s.session_start else 0
 
         s.metrics = {
-            "Total reps":              s.rep_count,
-            "Session duration":        f"{duration}s",
-            "Avg peak activation":     round(float(np.mean(peaks)), 1),
-            "Peak consistency (σ)":    round(float(np.std(peaks)), 1),
-            "Fatigue index":           f"{round(s.fatigue * 100)}%",
+            "Total reps":           s.rep_count,
+            "Session duration":     f"{dur}s",
+            "Avg peak z-score":     round(float(np.mean(peaks)), 2),
+            "Peak consistency (σ)": round(float(np.std(peaks)), 2),
+            "Fatigue index":        f"{round(s.fatigue * 100)}%",
         }
 
-        # Populate stat rows
         for w in self.metrics_frame.winfo_children():
             w.destroy()
 
         colors_map = {
             "Total reps":           COLORS["green"],
             "Session duration":     COLORS["text"],
-            "Avg peak activation":  COLORS["accent2"],
+            "Avg peak z-score":     COLORS["accent2"],
             "Peak consistency (σ)": COLORS["text"],
             "Fatigue index":        COLORS["yellow"],
         }
         for k, v in s.metrics.items():
             self._stat_row(self.metrics_frame, k, v, colors_map.get(k))
 
-        # Rep peaks bar chart
         self.met_ax.cla()
         self.met_ax.set_facecolor(COLORS["plot_bg"])
         if len(peaks) > 1:
-            xs = range(1, len(peaks) + 1)
-            bars = self.met_ax.bar(xs, peaks, color=COLORS["accent"],
-                                    width=0.6, alpha=0.85)
-            # Colour last few bars redder to show fatigue
+            bars = self.met_ax.bar(range(1, len(peaks) + 1), peaks,
+                                    color=COLORS["accent"], width=0.6, alpha=0.85)
             for i, bar in enumerate(bars):
                 fade = i / max(len(bars) - 1, 1)
                 bar.set_facecolor(plt.cm.RdYlGn(1 - fade * 0.8))
-
-            if s.threshold:
-                self.met_ax.axhline(s.threshold, color=COLORS["yellow"],
-                                     linestyle="--", linewidth=1,
-                                     label="threshold")
-                self.met_ax.legend(facecolor=COLORS["surface"],
-                                    labelcolor=COLORS["text2"], fontsize=7)
-
-        self.met_ax.set_xlabel("Rep", color=COLORS["text3"], fontsize=7,
-                                fontfamily="monospace")
-        self.met_ax.set_ylabel("Peak EMG", color=COLORS["text3"], fontsize=7,
-                                fontfamily="monospace")
+        self.met_ax.set_xlabel("Rep", color=COLORS["text3"], fontsize=7, fontfamily="monospace")
+        self.met_ax.set_ylabel("Peak z-score", color=COLORS["text3"], fontsize=7, fontfamily="monospace")
         self.met_ax.tick_params(colors=COLORS["text3"], labelsize=7)
         for spine in self.met_ax.spines.values():
             spine.set_color(COLORS["border"])
@@ -698,67 +691,68 @@ class ReSync(tk.Tk):
         self.met_canvas.draw_idle()
 
     # ─────────────────────────────────────────
-    # GUI UPDATE LOOP  (every 80ms)
+    # UPDATE LOOP  (every 80 ms)
     # ─────────────────────────────────────────
 
     def _update_loop(self):
-        s     = self.store
-        scr   = s.screen
-        hist  = list(s.emg_history)
+        s    = self.store
+        scr  = s.screen
+        hist = list(s.emg_history)
 
-        # ── Status dot ──
+        # Header status dot
         if s.connected:
             self.status_dot.config(fg=COLORS["green"])
             self.status_lbl.config(text="CONNECTED")
 
-        # ── Calibration mini plot ──
-        if scr == "CALIBRATE" and len(hist) > 1:
-            ln = self.mini_line_cal
-            ln.set_data(range(len(hist)), hist)
-            ax = self.mini_ax_cal
-            ax.set_xlim(0, len(hist))
-            ax.set_ylim(max(0, min(hist) - 50), max(hist) + 50)
-            self.mini_canvas_cal.draw_idle()
+        # ── Warmup / setup screen ───────────────
+        if scr == "CALIBRATE":
+            self.cal_prog_fill.place(relwidth=min(1.0, s.cal_progress))
 
-        # ── Session ──
+            # Reveal rep-target entry and Start button once warmup is done
+            if s.arduino_ready and not self._cal_ready_shown:
+                self._cal_ready_shown = True
+                self.cal_phase_lbl.config(text="BASELINE READY", fg=COLORS["green"])
+                self.cal_instruction.config(
+                    text="Warmup complete. Set an optional rep target\nthen press Start Session.")
+                self.cal_status_lbl.config(text="✓", fg=COLORS["green"])
+                self.rep_setup_frame.pack(anchor="w", pady=(8, 0))
+
+            if len(hist) > 1:
+                self.mini_line_cal.set_data(range(len(hist)), hist)
+                self.mini_ax_cal.set_xlim(0, len(hist))
+                self.mini_ax_cal.set_ylim(max(0, min(hist) - 50), max(hist) + 50)
+                self.mini_canvas_cal.draw_idle()
+
+        # ── Session screen ──────────────────────
         if scr == "SESSION":
-            if s.session_start is None:
-                s.session_start = time.time()
-
-            # Rep label
             self.rep_lbl.config(text=str(s.rep_count))
 
-            # Z-score
             z = s.z_score
-            self.z_lbl.config(
-                text=f"{z:+.2f}",
-                fg=COLORS["red"] if z > 2.5 else COLORS["accent2"])
-            zw = min(176, max(0, int(abs(z) / 6.0 * 176)))
-            self.z_bar_fill.place(width=zw)
+            self.z_lbl.config(text=f"{z:+.2f}",
+                               fg=COLORS["red"] if z > Z_THRESH else COLORS["accent2"])
+            self.z_bar_fill.place(width=min(176, max(0, int(abs(z) / 6.0 * 176))))
 
-            # Timer
-            elapsed = int(time.time() - s.session_start)
-            mm, ss  = divmod(elapsed, 60)
-            self.timer_lbl.config(text=f"{mm:02d}:{ss:02d}")
+            if s.session_start:
+                elapsed = int(time.time() - s.session_start)
+                mm, ss  = divmod(elapsed, 60)
+                self.timer_lbl.config(text=f"{mm:02d}:{ss:02d}")
 
-            # Fatigue bar
-            pct = s.fatigue
+            pct   = s.fatigue
             color = COLORS["green"] if pct < 0.5 else \
                     COLORS["yellow"] if pct < 0.8 else COLORS["red"]
             self.fat_fill.place(relwidth=pct)
             self.fat_fill.config(bg=color)
-            self.fat_lbl.config(text=f"{int(pct*100)}%")
+            self.fat_lbl.config(text=f"{int(pct * 100)}%")
 
-            # Main EMG plot
             if len(hist) > 1:
                 self.main_line.set_data(range(len(hist)), hist)
                 self.main_ax.set_xlim(0, len(hist))
-                self.main_ax.set_ylim(
-                    max(0, min(hist) - 50), max(hist) + 80)
-                if s.threshold:
-                    self.thresh_line.set_ydata([s.threshold, s.threshold])
-                    self.thresh_line.set_visible(True)
+                self.main_ax.set_ylim(max(0, min(hist) - 50), max(hist) + 80)
                 self.main_canvas.draw_idle()
+
+            # Auto-navigate to metrics when Arduino signals session done
+            if s.session_complete:
+                self._go_to_metrics()
 
         self.after(80, self._update_loop)
 
