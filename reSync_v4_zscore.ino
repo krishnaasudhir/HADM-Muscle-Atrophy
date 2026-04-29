@@ -54,7 +54,7 @@ float repPeakZ[MAX_REPS];   // peak z-score recorded for each rep
 float peakZThisRep = 0.0;   // running peak z during current activation
 
 // ── Session control ───────────────────────────
-enum State { WARMUP_STATE, WAIT_STATE, RUNNING_STATE, DONE_STATE };
+enum State { WARMUP_STATE, WAIT_STATE, RUNNING_STATE };
 State state      = WARMUP_STATE;
 int   targetReps = 0;   // 0 = no limit, run until fatigue
 
@@ -117,14 +117,35 @@ float computeZ(float x) {
 
 
 // ═════════════════════════════════════════════
+//  END SESSION — reset and return to WAIT_STATE
+// ═════════════════════════════════════════════
+void endSession(const char* msg) {
+  digitalWrite(PIN_RED_LED, HIGH);
+  setLED(0);
+  Serial.println(msg);
+  Serial.println();
+
+  // Reset session variables; Welford baseline is preserved
+  repCount     = 0;
+  peakZThisRep = 0.0;
+  fatigued     = false;
+  active       = false;
+  prevActive   = false;
+  targetReps   = 0;
+  for (int i = 0; i < MAX_REPS; i++) repPeakZ[i] = 0.0;
+
+  state = WAIT_STATE;
+  Serial.println("Enter a rep target (e.g. '10'), then 's' to start a new session.");
+  Serial.println("Or just 's' to run until fatigue.");
+}
+
+
+// ═════════════════════════════════════════════
 //  MAIN LOOP
 // ═════════════════════════════════════════════
 void loop() {
   int raw      = analogRead(PIN_EMG);
   int smoothed = smooth(raw);
-
-  // ── DONE: session over, nothing to do ───────
-  if (state == DONE_STATE) return;
 
   // ── WARMUP: build resting baseline ──────────
   if (state == WARMUP_STATE) {
@@ -165,6 +186,7 @@ void loop() {
       input.trim();
       if (input.equalsIgnoreCase("s")) {
         state = RUNNING_STATE;
+        digitalWrite(PIN_RED_LED, LOW);
         Serial.print("Starting! ");
         if (targetReps > 0) {
           Serial.print("Target: "); Serial.print(targetReps); Serial.println(" reps.");
@@ -191,10 +213,7 @@ void loop() {
   if (Serial.available()) {
     char c = (char)Serial.read();
     if (c == 'q' || c == 'Q') {
-      state = DONE_STATE;
-      digitalWrite(PIN_RED_LED, HIGH);
-      setLED(0);
-      Serial.println("Session ended early.");
+      endSession("Session ended early.");
       return;
     }
   }
@@ -212,10 +231,7 @@ void loop() {
     if (repCount < MAX_REPS) repCount++;
     Serial.print("Rep: "); Serial.println(repCount);
     if (targetReps > 0 && repCount >= targetReps) {
-      state = DONE_STATE;
-      digitalWrite(PIN_RED_LED, HIGH);
-      setLED(0);
-      Serial.println("*** TARGET REPS REACHED — well done! ***");
+      endSession("*** TARGET REPS REACHED — well done! ***");
       prevActive = active;
       return;
     }
@@ -236,11 +252,7 @@ void loop() {
       Serial.print(" baseline="); Serial.println(baselineAvg, 2);
 
       if (repPeakZ[idx] > baselineAvg * FATIGUE_RATIO) {
-        fatigued = true;
-        state = DONE_STATE;
-        digitalWrite(PIN_RED_LED, HIGH);
-        setLED(0);
-        Serial.println("*** FATIGUE DETECTED — rest now ***");
+        endSession("*** FATIGUE DETECTED — rest now ***");
         prevActive = active;
         return;
       }
