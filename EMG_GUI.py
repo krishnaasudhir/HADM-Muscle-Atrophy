@@ -180,6 +180,9 @@ class BluetoothReader:
         elif 'start a new session' in line:
             s.arduino_in_wait = True
 
+        # Mark data as flowing and record timestamp for signal health check
+        s.last_rx = time.time()
+
 
 # ─────────────────────────────────────────────
 # APP STATE
@@ -203,6 +206,8 @@ class Store:
         self.arduino_in_wait  = False   # Arduino returned to WAIT_STATE after session
         self.session_complete = False   # fatigue / reps reached / quit
         self.target_reps      = 0       # 0 = no limit
+        self.port_open        = False   # COM port opened successfully
+        self.last_rx          = 0.0     # timestamp of last received serial line
 
 
 # ─────────────────────────────────────────────
@@ -343,20 +348,28 @@ class ReSync(tk.Tk):
         tk.Label(left, text="Building EMG baseline — keep muscle at rest",
                  font=FONT_SMALL, bg=COLORS["bg"], fg=COLORS["text2"]).pack(anchor="w", pady=(2, 24))
 
-        self.cal_phase_lbl = tk.Label(left, text="COLLECTING BASELINE...",
+        self.cal_phase_lbl = tk.Label(left, text="READY TO CALIBRATE",
                                        font=FONT_MED, bg=COLORS["bg"],
-                                       fg=COLORS["accent2"], wraplength=340, justify="left")
+                                       fg=COLORS["text"], wraplength=340, justify="left")
         self.cal_phase_lbl.pack(anchor="w", pady=(0, 8))
 
         self.cal_instruction = tk.Label(
             left,
-            text="Relax the target muscle completely.\nThe device is sampling your resting signal.",
+            text="Place the sensor on your muscle, then press\nStart Calibration when ready.",
             font=FONT_SMALL, bg=COLORS["bg"], fg=COLORS["text2"], justify="left")
-        self.cal_instruction.pack(anchor="w", pady=(0, 24))
+        self.cal_instruction.pack(anchor="w", pady=(0, 16))
 
-        tk.Label(left, text="WARMUP PROGRESS", font=FONT_LABEL,
+        self.btn_start_cal = self._make_button(
+            left, "[ START CALIBRATION ]",
+            command=self._on_start_cal,
+            color=COLORS["accent2"], width=26)
+        self.btn_start_cal.pack(anchor="w", pady=(0, 20))
+
+        # Progress bar — hidden until calibration starts
+        self.cal_prog_frame = tk.Frame(left, bg=COLORS["bg"])
+        tk.Label(self.cal_prog_frame, text="WARMUP PROGRESS", font=FONT_LABEL,
                  bg=COLORS["bg"], fg=COLORS["text3"]).pack(anchor="w")
-        prog_bg = tk.Frame(left, bg=COLORS["surface2"], height=8,
+        prog_bg = tk.Frame(self.cal_prog_frame, bg=COLORS["surface2"], height=8,
                             highlightthickness=1, highlightbackground=COLORS["border"])
         prog_bg.pack(fill="x", pady=(4, 20))
         self.cal_prog_fill = tk.Frame(prog_bg, bg=COLORS["accent"], height=8)
@@ -582,7 +595,7 @@ class ReSync(tk.Tk):
             try:
                 self.reader = BluetoothReader(self.store, port)
                 self.reader.start()
-                self.store.connected = True
+                self.store.port_open = True
                 self.after(0, lambda: [
                     self.connect_msg.config(text=f"Connected on {port}", fg=COLORS["green"]),
                     self.after(600, lambda: self._show_screen("CALIBRATE"))
@@ -594,6 +607,15 @@ class ReSync(tk.Tk):
                 ])
 
         threading.Thread(target=attempt, daemon=True).start()
+
+    def _on_start_cal(self):
+        """Send 's' to Arduino to begin warmup, then show progress bar."""
+        self.reader.send('s')
+        self.btn_start_cal.config(state="disabled")
+        self.cal_phase_lbl.config(text="COLLECTING BASELINE...", fg=COLORS["accent2"])
+        self.cal_instruction.config(
+            text="Relax the target muscle completely.\nThe device is sampling your resting signal.")
+        self.cal_prog_frame.pack(anchor="w", fill="x", pady=(0, 4))
 
     def _on_start_session(self):
         """Send optional rep target then 's' to Arduino, then show SESSION screen."""
@@ -644,6 +666,7 @@ class ReSync(tk.Tk):
         self.cal_instruction.config(
             text="Set an optional rep target and press Start Session.")
         self.cal_status_lbl.config(text="✓", fg=COLORS["green"])
+        self.btn_start_cal.config(state="disabled")  # warmup already done, no re-cal needed
         self.cal_prog_fill.place(relwidth=1.0)
         self.rep_setup_frame.pack(anchor="w", pady=(8, 0))
         self._show_screen("CALIBRATE")
@@ -699,10 +722,16 @@ class ReSync(tk.Tk):
         scr  = s.screen
         hist = list(s.emg_history)
 
-        # Header status dot
-        if s.connected:
+        # Header status dot — reflects actual data flow, not just port open
+        if not s.port_open:
+            self.status_dot.config(fg=COLORS["red"])
+            self.status_lbl.config(text="DISCONNECTED")
+        elif time.time() - s.last_rx < 3.0:
             self.status_dot.config(fg=COLORS["green"])
             self.status_lbl.config(text="CONNECTED")
+        else:
+            self.status_dot.config(fg=COLORS["yellow"])
+            self.status_lbl.config(text="NO SIGNAL")
 
         # ── Warmup / setup screen ───────────────
         if scr == "CALIBRATE":
