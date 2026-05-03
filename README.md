@@ -1,7 +1,7 @@
-# ThreshHold — EMG Workout Monitor
+# ThreshHold
 
 Real-time muscle activation tracker using an EMG sensor, Arduino, and Bluetooth.
-Counts reps, detects fatigue, and streams live data to a desktop GUI — no manual calibration needed.
+Counts reps, detects fatigue, and streams live data to a desktop GUI.
 
 ---
 
