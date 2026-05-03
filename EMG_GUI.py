@@ -84,13 +84,19 @@ class BluetoothReader:
         self.running = False
 
     def start(self):
-        self.ser = serial.Serial(self.port, self.baud, timeout=1)
+        self.ser = serial.Serial(self.port, self.baud, timeout=1, write_timeout=2)
         self.running = True
         threading.Thread(target=self._run, daemon=True).start()
 
     def send(self, text):
-        if self.ser and self.ser.is_open:
-            self.ser.write((str(text) + '\n').encode('utf-8'))
+        threading.Thread(target=self._send, args=(text,), daemon=True).start()
+
+    def _send(self, text):
+        try:
+            if self.ser and self.ser.is_open:
+                self.ser.write((str(text) + '\n').encode('utf-8'))
+        except Exception:
+            pass
 
     def stop(self):
         self.running = False
@@ -102,6 +108,7 @@ class BluetoothReader:
             try:
                 line = self.ser.readline().decode('utf-8', errors='replace').strip()
                 if line:
+                    print(f"[RX] {line}")
                     self._parse(line)
             except Exception:
                 pass
@@ -135,8 +142,10 @@ class BluetoothReader:
             except (IndexError, ValueError, ZeroDivisionError):
                 pass
 
-        # Warmup complete: "Baseline ready — mean=X sigma=Y"
-        elif 'Baseline ready' in line:
+        # Warmup complete — any of these lines signal Arduino is in WAIT_STATE
+        elif ('Baseline ready' in line
+              or 'run until fatigue' in line
+              or 'start a new session' in line):
             s.cal_progress  = 1.0
             s.arduino_ready = True
 
@@ -181,7 +190,8 @@ class BluetoothReader:
             s.arduino_in_wait = True
 
         # Mark data as flowing and record timestamp for signal health check
-        s.last_rx = time.time()
+        s.last_rx       = time.time()
+        s.ever_received = True
 
 
 # ─────────────────────────────────────────────
@@ -208,6 +218,7 @@ class Store:
         self.target_reps      = 0       # 0 = no limit
         self.port_open        = False   # COM port opened successfully
         self.last_rx          = 0.0     # timestamp of last received serial line
+        self.ever_received    = False   # True once any data has arrived
 
 
 # ─────────────────────────────────────────────
@@ -227,7 +238,9 @@ class ReSync(tk.Tk):
 
         self._cal_ready_shown = False
         self._session_ended   = False
+        self._after_id        = None
 
+        self.protocol("WM_DELETE_WINDOW", self._on_close)
         self._build_ui()
         self._update_loop()
 
@@ -365,8 +378,9 @@ class ReSync(tk.Tk):
             color=COLORS["accent2"], width=26)
         self.btn_start_cal.pack(anchor="w", pady=(0, 20))
 
-        # Progress bar — hidden until calibration starts
+        # Progress bar
         self.cal_prog_frame = tk.Frame(left, bg=COLORS["bg"])
+        self.cal_prog_frame.pack(anchor="w", fill="x", pady=(0, 4))
         tk.Label(self.cal_prog_frame, text="WARMUP PROGRESS", font=FONT_LABEL,
                  bg=COLORS["bg"], fg=COLORS["text3"]).pack(anchor="w")
         prog_bg = tk.Frame(self.cal_prog_frame, bg=COLORS["surface2"], height=8,
@@ -596,6 +610,7 @@ class ReSync(tk.Tk):
                 self.reader = BluetoothReader(self.store, port)
                 self.reader.start()
                 self.store.port_open = True
+                self.store.last_rx   = time.time()  # grace period — Arduino may be silent
                 self.after(0, lambda: [
                     self.connect_msg.config(text=f"Connected on {port}", fg=COLORS["green"]),
                     self.after(600, lambda: self._show_screen("CALIBRATE"))
@@ -610,12 +625,18 @@ class ReSync(tk.Tk):
 
     def _on_start_cal(self):
         """Send 's' to Arduino to begin warmup, then show progress bar."""
-        self.reader.send('s')
+        if self.reader is None:
+            self.cal_phase_lbl.config(text="NOT CONNECTED", fg=COLORS["red"])
+            return
+        try:
+            self.reader.send('s')
+        except Exception as e:
+            self.cal_phase_lbl.config(text=f"Send failed: {e}", fg=COLORS["red"])
+            return
         self.btn_start_cal.config(state="disabled")
         self.cal_phase_lbl.config(text="COLLECTING BASELINE...", fg=COLORS["accent2"])
         self.cal_instruction.config(
             text="Relax the target muscle completely.\nThe device is sampling your resting signal.")
-        self.cal_prog_frame.pack(anchor="w", fill="x", pady=(0, 4))
 
     def _on_start_session(self):
         """Send optional rep target then 's' to Arduino, then show SESSION screen."""
@@ -717,7 +738,20 @@ class ReSync(tk.Tk):
     # UPDATE LOOP  (every 80 ms)
     # ─────────────────────────────────────────
 
+    def _on_close(self):
+        if self._after_id is not None:
+            self.after_cancel(self._after_id)
+        if self.reader:
+            self.reader.stop()
+        self.destroy()
+
     def _update_loop(self):
+        try:
+            self._update_loop_body()
+        except tk.TclError:
+            return  # window was closed, stop scheduling
+
+    def _update_loop_body(self):
         s    = self.store
         scr  = s.screen
         hist = list(s.emg_history)
@@ -729,13 +763,26 @@ class ReSync(tk.Tk):
         elif time.time() - s.last_rx < 3.0:
             self.status_dot.config(fg=COLORS["green"])
             self.status_lbl.config(text="CONNECTED")
-        else:
+        elif s.arduino_ready and scr in ("CALIBRATE", "SESSION"):
+            # Arduino in WAIT_STATE / RUNNING_STATE — silence is expected
+            self.status_dot.config(fg=COLORS["green"])
+            self.status_lbl.config(text="READY")
+        elif s.ever_received:
             self.status_dot.config(fg=COLORS["yellow"])
             self.status_lbl.config(text="NO SIGNAL")
+        else:
+            self.status_dot.config(fg=COLORS["yellow"])
+            self.status_lbl.config(text="WAITING FOR ARDUINO")
 
         # ── Warmup / setup screen ───────────────
         if scr == "CALIBRATE":
             self.cal_prog_fill.place(relwidth=min(1.0, s.cal_progress))
+
+            # Stale Arduino: raw= data is flowing but warmup never happened this session
+            if not s.arduino_ready and not self._cal_ready_shown and len(hist) > 20 and s.cal_progress == 0.0:
+                self.cal_phase_lbl.config(text="DEVICE ALREADY RUNNING", fg=COLORS["yellow"])
+                self.cal_instruction.config(
+                    text="Arduino is in an active session from before.\nPower-cycle it (unplug/replug), then click Start Calibration.")
 
             # Reveal rep-target entry and Start button once warmup is done
             if s.arduino_ready and not self._cal_ready_shown:
@@ -783,7 +830,8 @@ class ReSync(tk.Tk):
             if s.session_complete:
                 self._go_to_metrics()
 
-        self.after(80, self._update_loop)
+        self._after_id = self.after(80, self._update_loop)
+
 
 
 # ─────────────────────────────────────────────

@@ -153,6 +153,11 @@ void loop() {
       String input = Serial.readStringUntil('\n');
       input.trim();
       if (input.equalsIgnoreCase("s")) {
+        blinkLED(255, 2);   // 2 quick flashes = 's' received OK
+        // Reset Welford so every calibration starts from a clean slate
+        wCount = 0;
+        wMean  = 0.0;
+        wM2    = 0.0;
         state = WARMUP_STATE;
         Serial.println("Starting calibration — relax your muscle...");
       }
@@ -175,11 +180,15 @@ void loop() {
       setLED(0);
       blinkLED(255, 3);
       delay(500);
+      float sigmaFinal = welfordStdDev();
       state = WAIT_STATE;
       Serial.print("Baseline ready — mean=");
       Serial.print(wMean);
       Serial.print(" sigma=");
-      Serial.println(welfordStdDev());
+      Serial.println(sigmaFinal);
+      if (sigmaFinal > 150.0) {
+        Serial.println("WARNING: sigma too large — sensor may not be on skin. Power-cycle and redo.");
+      }
       Serial.println();
       Serial.println("Enter a rep target (e.g. '10'), then 's' to start.");
       Serial.println("Or just 's' to run until fatigue.");
